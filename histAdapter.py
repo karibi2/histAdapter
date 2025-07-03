@@ -72,14 +72,6 @@ parser.add_argument('--message_support', action='store_true',
 # Parse arguments
 args = parser.parse_args()
 
-# Calculate the path to shared_modules and to sys.path
-script_dir = os.path.dirname(__file__)
-module_path = os.path.abspath(os.path.join(script_dir, '..', 'shared_modules'))
-sys.path.insert(0, module_path)
-import notification as notification
-
-HIST_ADAPTER_VERSION = '25.04.27'
-
 PG_CONN = {
     "host": args.pg_server,
     "port": args.pg_port,
@@ -87,6 +79,29 @@ PG_CONN = {
     "user": args.pg_user,
     "password": args.pg_password
 }
+
+# Command line parameters take priority so must ensure that if passed they will be written out to required
+# environmental variables.
+os.environ['HIST_SERVER'] = args.hist_server
+os.environ['HIST_SECRET'] = args.hist_secret
+os.environ['PG_PORT'] = args.pg_port
+os.environ['PG_USER'] = args.pg_user
+os.environ['PG_PASSWORD'] = args.pg_password
+os.environ['PG_SERVER'] = args.pg_server
+os.environ['DEBUG'] = args.debug
+os.environ['BACKFILL'] = args.backfill
+os.environ['HIST_CONNECTION_TIMEOUT'] = args.hist_connection_timeout
+os.environ['HIST_RESPONSE_TIMEOUT'] = args.hist_response_timeout
+os.environ['MESSAGE_SUPPORT'] = args.message_support
+
+
+# Calculate the path to shared_modules and to sys.path
+script_dir = os.path.dirname(__file__)
+module_path = os.path.abspath(os.path.join(script_dir, '..', 'shared_modules'))
+sys.path.insert(0, module_path)
+import notification as notification
+
+HIST_ADAPTER_VERSION = '25.04.27'
 
 
 LOG_PATH = './logs/trace.log'
