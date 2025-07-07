@@ -13,8 +13,9 @@ from dotenv import load_dotenv
 import sys
 import inspect
 import traceback
+import pytz
 
-HIST_ADAPTER_VERSION = '25.04.27'
+HIST_ADAPTER_VERSION = '25.07.07'
 
 # Load environment variables from .env file
 load_dotenv()
@@ -74,7 +75,7 @@ parser.add_argument('--message_support', action='store_true',
 # Parse arguments
 args = parser.parse_args()
 
-PG_CONN = {
+POSTGRES_CONNECTION = {
     "host": args.pg_server,
     "port": args.pg_port,
     "dbname": "guardsman",
@@ -167,7 +168,7 @@ def query_postgres(connection_params: Dict[str, Any], sql_statement: str, params
         # Handle other errors
         status_code = 2
         logger.error(f"Error: {e}")
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                        'Import Shared Modules', traceback.format_exc() + ' - ' +
                                        inspect.currentframe().f_code.co_name)
         if MESSAGE_SUPPORT:
@@ -179,6 +180,54 @@ def query_postgres(connection_params: Dict[str, Any], sql_statement: str, params
             conn.close()
 
     return status_code, result_df
+
+
+def update_system_status(db_connection, mode, plant_ref=None, samples = 0):
+    """
+    mode:
+    1. Last Successful Insertion of historian data into Postgres
+    2. Last Failed Insertion of historian data into Postgres
+
+
+    Args:
+        db_connection:
+        mode:
+
+    Returns:
+
+    """
+    function_name = 'update_system_status'
+
+    try:
+        # Establish a connection to the PostgreSQL database
+        with psycopg.connect(**db_connection) as connection:
+            # Create a cursor object to execute SQL queries
+            with connection.cursor() as cursor:
+                # Execute the query to insert the message log
+                # Pass the current datetime and log details as parameters
+                date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                match mode:
+                    case 1:
+                        cursor.execute('update system_status set value = %s where id = 1;', (date_str,))
+                        cursor.execute('update system_status set value = %s where id = 3;', (plant_ref,))
+                        cursor.execute('update system_status set value = %s where id = 5;', (samples,))
+                    case 2:
+                        cursor.execute('update system_status set value = %s where id = 2;', (date_str,))
+                        cursor.execute('update system_status set value = %s where id = 4;', (plant_ref,))
+                        cursor.execute('update system_status set value = %s where id = 6;', (samples,))
+
+                connection.commit()
+
+        # Return True to indicate successful log writing
+        return True
+    except Exception as error:
+        logger.error(error)
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', r'train/evaluate',
+                                          function_name, traceback.format_exc())
+        if MESSAGE_SUPPORT:
+            notification.email_support()
+        return False
+
 
 def request_api(token, query_url):
     """
@@ -212,130 +261,6 @@ def request_api(token, query_url):
     except:
         return False, None
 
-
-
-def read_time_series_data(connection_params: Dict[str, Any], table_name: str, tag_list: str, 
-                      start_time, end_time, sample_interval: int) -> pd.DataFrame:
-    """
-    Query time series data from a TimescaleDB table with sampling, gap filling, and interpolation.
-
-    Args:
-        connection_params (Dict[str, Any]): Database connection parameters
-        table_name (str): Name of the table to query
-        tag_list (str): Comma-delimited string of metrics/tags to retrieve
-        start_time: Start time for the query (inclusive)
-        end_time: End time for the query (exclusive)
-        sample_interval (int): Sampling interval in seconds
-
-    Returns:
-        pd.DataFrame: DataFrame with timestamp column and one column per tag, ordered by timestamp
-    """
-    function_name = 'read_time_series_data'
-    try:
-        # Check for empty tag_list
-        if not tag_list or tag_list.strip() == '':
-            logger.warning("Empty tag list provided to read_time_series_data")
-            return pd.DataFrame(columns=['timestamp'])
-
-        # Convert comma-delimited string to list
-        tags = [tag.strip() for tag in tag_list.split(',')]
-
-        # Validate table_name to prevent SQL injection
-        if not table_name or not isinstance(table_name, str) or ';' in table_name:
-            logger.error(f"Invalid table name provided: {table_name}")
-            notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
-                                           'Import Shared Modules', traceback.format_exc() + ' - ' +
-                                           inspect.currentframe().f_code.co_name)
-            if MESSAGE_SUPPORT:
-                notification.email_support()
-
-            return pd.DataFrame(columns=['timestamp'] + tags)
-
-        # Build the SQL query with time bucketing, interpolation, and gap filling
-        # For each tag, we create a subquery that selects the tag's data and pivots it
-        subqueries = []
-        query_params = []
-
-        for tag in tags:
-            # Use parameterized queries for all values including tag names for security
-            subquery = """
-            SELECT 
-                time_bucket(%s, time_bucket_gapfill(%s, "timestamp", %s, %s)) as bucket_time,
-                %s as metric_name,
-                LOCF(AVG(value)) as value
-            FROM """ + table_name + """
-            WHERE metric_name = %s
-            AND quality = 'good'
-            AND "timestamp" >= %s
-            AND "timestamp" < %s
-            GROUP BY bucket_time, metric_name
-            """
-            subqueries.append(subquery)
-            query_params.extend([
-                f'{sample_interval} seconds',
-                f'{sample_interval} seconds',
-                start_time,
-                end_time,
-                tag,
-                tag,
-                start_time,
-                end_time
-            ])
-
-        # Combine all subqueries with UNION ALL
-        combined_query = " UNION ALL ".join(subqueries)
-
-        # Build the case statements for pivoting
-        case_statements = []
-        for tag in tags:
-            case_statements.append(f'MAX(CASE WHEN metric_name = %s THEN value END) as "{tag}"')
-            query_params.append(tag)
-
-        # Final query to pivot the data
-        final_query = """
-        WITH combined_data AS (
-            """ + combined_query + """
-        )
-        SELECT 
-            bucket_time as timestamp,
-            """ + ', '.join(case_statements) + """
-        FROM combined_data
-        GROUP BY bucket_time
-        ORDER BY bucket_time
-        """
-
-        # Execute the query
-        status_code, result_df = query_postgres(
-            connection_params, 
-            final_query, 
-            params=query_params
-        )
-
-        if status_code != 0 or result_df is None:
-            # Return empty DataFrame with correct columns if query fails
-            logger.error(f"Query failed with status code {status_code}")
-            notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
-                                           'Import Shared Modules', traceback.format_exc() + ' - ' +
-                                           inspect.currentframe().f_code.co_name)
-            if MESSAGE_SUPPORT:
-                notification.email_support()
-            return pd.DataFrame(columns=['timestamp'] + tags)
-
-        # Ensure the result is ordered by timestamp (should already be from the query)
-        if not result_df.empty and 'timestamp' in result_df.columns:
-            result_df = result_df.sort_values('timestamp')
-
-        return result_df
-
-    except Exception as e:
-        # Handle any other unexpected errors
-        logger.error(f"Unexpected error in read_time_series_data: {e}")
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
-                                       'Import Shared Modules', traceback.format_exc() + ' - ' +
-                                       inspect.currentframe().f_code.co_name)
-        if MESSAGE_SUPPORT:
-            notification.email_support()
-        return pd.DataFrame(columns=['timestamp'])
 
 def extract_unique_tags(tag_list_df):
     """
@@ -415,7 +340,7 @@ def get_token():
                 status_code = response.status_code
                 message = f"Error retrieving token: {response.status_code} for Historian {HISTORIAN_SERVER_NAME} - Retrying - Count {retry_count}"
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                function_name, message)
 
                 # Increment retry counter
@@ -424,12 +349,12 @@ def get_token():
                 if retry_count < MAX_RETRIES:
                     message = f"Retrying in {RETRY_DELAY} seconds (attempt {retry_count}/{MAX_RETRIES})"
                     logger.info(message)
-                    notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                    notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                       function_name, message)
                     time.sleep(RETRY_DELAY)
                 else:
                     logger.error(f"System stopped after {MAX_RETRIES} failed attempts")
-                    notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+                    notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                                       function_name, message)
 
                     if MESSAGE_SUPPORT:
@@ -438,7 +363,7 @@ def get_token():
         except Exception as e:
             status_code = -1
             logger.error(f"Exception retrieving token for Historian {HISTORIAN_SERVER_NAME}: {str(e)}")
-            notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+            notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                            'Import Shared Modules', traceback.format_exc() + ' - ' +
                                            inspect.currentframe().f_code.co_name)
             if MESSAGE_SUPPORT:
@@ -452,7 +377,7 @@ def get_token():
                 time.sleep(RETRY_DELAY)
             else:
                 logger.error(f"System stopped after {MAX_RETRIES} failed attempts - Possible invalid client secret")
-                notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                                'Import Shared Modules', traceback.format_exc() + ' - ' +
                                                inspect.currentframe().f_code.co_name)
                 if MESSAGE_SUPPORT:
@@ -504,7 +429,7 @@ def get_raw_data(token, start_utc, end_utc, tag_list):
             if len(data) == 0:
                 message = f"No data returned for tags {tag_list_str} between {start_utc_str} and {end_utc_str}"
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                function_name, message)
             else:
                 num_tags = len(tag_list_str.split(";"))
@@ -537,7 +462,7 @@ def get_raw_data(token, start_utc, end_utc, tag_list):
             if retry_count < MAX_RETRIES:
                 message = f"Retrying get_raw_data in {RETRY_DELAY} seconds (attempt {retry_count}/{MAX_RETRIES})"
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                function_name, message)
                 import time
                 time.sleep(RETRY_DELAY)
@@ -545,7 +470,7 @@ def get_raw_data(token, start_utc, end_utc, tag_list):
                 message = (f"System stopped after {MAX_RETRIES} failed attempts get raw data for tags {tag_list_str} "
                            f"between {start_utc_str} and {end_utc_str}")
                 logger.error(message)
-                notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                                function_name, message)
                 if MESSAGE_SUPPORT:
                     notification.email_support()
@@ -572,7 +497,7 @@ def historian_data_insert(asset_data_df, asset_id, start_time, end_time):
         message = (f"No data to insert into historian_data table for asset id {asset_id} between {start_time} "
                    f"and {end_time}")
 
-        notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                           function_name, message)
         return 0
 
@@ -582,7 +507,7 @@ def historian_data_insert(asset_data_df, asset_id, start_time, end_time):
 
         # Connect to the PostgreSQL database directly for batch operation
         try:
-            conn = psycopg.connect(**PG_CONN)
+            conn = psycopg.connect(**POSTGRES_CONNECTION)
 
             # Create a cursor
             with conn.cursor() as cursor:
@@ -596,9 +521,13 @@ def historian_data_insert(asset_data_df, asset_id, start_time, end_time):
                         row['Value']
                     ))
 
-                # Use executemany for batch insertion
+                # Use executemany with ON CONFLICT DO NOTHING for batch insertion
                 cursor.executemany(
-                    "INSERT INTO historian_data (quality, timestamp, metric_name, value) VALUES (%s, %s, %s, %s)",
+                    """
+                    INSERT INTO historian_data (quality, timestamp, metric_name, value)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (timestamp, metric_name, value, quality) DO NOTHING
+                    """,
                     data_to_insert
                 )
 
@@ -608,7 +537,7 @@ def historian_data_insert(asset_data_df, asset_id, start_time, end_time):
             if DEBUG:
                 message = (f"Successfully inserted {len(data_to_insert)} rows into historian_data table for ")
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                   function_name, message)
             return 0
 
@@ -620,7 +549,7 @@ def historian_data_insert(asset_data_df, asset_id, start_time, end_time):
     except Exception as e:
         message = f"Error inserting data into historian_data table: {e}"
         logger.error(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                        function_name, traceback.format_exc() + ' - ' +
                                        inspect.currentframe().f_code.co_name)
         if MESSAGE_SUPPORT:
@@ -640,12 +569,12 @@ def process_assets():
     function_name = 'process_assets'
     status, token = get_token()
     sql_query = 'SELECT asset_id, tag_list, date_last_data FROM asset'
-    status_code, assets_df = query_postgres(PG_CONN, sql_query)
+    status_code, assets_df = query_postgres(POSTGRES_CONNECTION, sql_query)
 
     if status_code != 0:
         message = "Error querying assets from database"
         logger.error(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                        function_name, message)
         if MESSAGE_SUPPORT:
             notification.email_support()
@@ -654,37 +583,38 @@ def process_assets():
     if assets_df.empty:
         message = "No assets found in database"
         logger.info(message)
-        notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                        function_name, message)
         return
     if DEBUG:
         message = f"Processing {len(assets_df)} assets"
         logger.info(message)
-        notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                        function_name, message)
 
 
     # Process each asset
     for _, asset in assets_df.iterrows():
-        current_time = datetime.now(timezone.utc) - timedelta(seconds=10)
+        current_time = datetime.now(timezone.utc)
         asset_id = asset['asset_id']
+        plant_ref = asset['plant_ref']
         tag_list = asset['tag_list']
         date_last_data = asset['date_last_data']
 
         if DEBUG:
             message = f"Processing asset ID: {asset_id}"
             logger.info(message)
-            notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+            notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                               function_name, message)
 
-        # If date_last_data is null, set it to current datetime - 4 weeks
+        # If date_last_data is null, set it to current datetime - Backfill
         if pd.isna(date_last_data):
             date_last_data = current_time - timedelta(days=BACKFILL)
 
             if DEBUG:
                 message = f"Asset {asset_id} has null date_last_data, using {date_last_data}"
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                   function_name, message)
 
         # Ensure date_last_data is a datetime object with timezone
@@ -698,19 +628,21 @@ def process_assets():
             date_last_data = date_last_data.replace(tzinfo=timezone.utc)
 
         # Create time loop from date_last_data to current time in 1-hour increments
-        start_time = date_last_data
-        while start_time < current_time:
+        # It is possible that data may have been recorded by Historian but not yet written to discuss
+        # Thus an overlap of 1 minutes is created to guard against this
+        start_time = (date_last_data - timedelta(minutes=1)).astimezone(pytz.UTC)
+        end_time = min(start_time + timedelta(hours=1), current_time).astimezone(pytz.UTC)
+        while True:
             # Calculate end time (start time + 1 hour or current time, whichever is earlier)
             end_time = min(start_time + timedelta(hours=1), current_time)
 
             if DEBUG:
                 message = f"Processing time increment for asset {asset_id}: {start_time} to {end_time}"
                 logger.info(message)
-                notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                   function_name, message)
 
-            # Call the test function
-
+            # get the Raw Data
             asset_data_df = get_raw_data(token, start_time, end_time, tag_list)
 
             if len(asset_data_df) > 0:
@@ -718,10 +650,11 @@ def process_assets():
                 # Insert data into historian_data table
                 insert_status = historian_data_insert(asset_data_df, asset_id, start_time, end_time)
                 if insert_status == 0:
+                    update_system_status(POSTGRES_CONNECTION, 1, {plant_ref}, len(assets_df))
                     if DEBUG:
                         message = f"Successfully inserted data for asset {asset_id} from {start_time} to {end_time}"
                         logger.info(message)
-                        notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+                        notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                           function_name, message)
 
                         # Update the date_last_data field in the database
@@ -730,16 +663,24 @@ def process_assets():
                     SET date_last_data = '{end_time}' 
                     WHERE asset_id = {asset_id}
                     """
-                    update_status, _ = query_postgres(PG_CONN, update_query)
+                    update_status, _ = query_postgres(POSTGRES_CONNECTION, update_query)
                     if update_status != 0:
                         message = f"Error updating date_last_data for asset {asset_id}"
                         logger.error(message)
-                        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+                        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                                        function_name, message)
                         if MESSAGE_SUPPORT:
                             notification.email_support()
+                else:
+                    # Insert operation in PostgreSQL Failed
+                    update_system_status(POSTGRES_CONNECTION, 2, {plant_ref}, len(assets_df))
 
-            start_time = end_time
+
+            # 1 Minute overlap to guard against missing data
+            if end_time == current_time:
+                break
+            start_time = end_time - timedelta(minutes=1)
+
 
 def get_tag_properties(token, tagname):
     """
@@ -768,7 +709,7 @@ def get_tag_properties(token, tagname):
     if not status:
         message = f"System Stopped - Error retrieving tag properties for tagname {tagname}"
         logger.debug(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                           function_name, message)
         exit(-3)
     else:
@@ -786,17 +727,17 @@ def main():
     function_name = 'main'
     message = f"HistAdapter Started - {HIST_ADAPTER_VERSION}"
     logger.info(message)
-    notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+    notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                       function_name, message)
 
 
     # Get taglist
-    sql_query = "select asset_id, tag_list, date_last_data from asset where historian = 'hist'"
-    status_code, tag_list_df = query_postgres(PG_CONN, sql_query)
+    sql_query = "select asset_id, plant_ref, tag_list, date_last_data from asset where historian = 'hist'"
+    status_code, tag_list_df = query_postgres(POSTGRES_CONNECTION, sql_query)
     if status_code != 0:
         message = "Error querying tag_list from database"
         logger.error(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                           function_name, message)
         if MESSAGE_SUPPORT:
             notification.email_support()
@@ -804,7 +745,7 @@ def main():
     if tag_list_df.empty:
         message = "No tag_list found in database"
         logger.info(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                           function_name, message)
 
 
@@ -815,12 +756,12 @@ def main():
         if DEBUG:
             message = f"Extracted {len(unique_tags_str.split(','))} unique tags"
             logger.info(message)
-            notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+            notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                               function_name, message)
     except Exception as e:
         message = "System Stopped - Error extracting unique tags {e}"
         logger.error(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',
                                           function_name, message)
         if MESSAGE_SUPPORT:
             notification.email_support()
@@ -830,7 +771,7 @@ def main():
     if DEBUG:
         message = f"Retrieved token: {token}"
         logger.info(message)
-        notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                           function_name, message)
 
     # Does the tag exist
@@ -849,12 +790,12 @@ def main():
         if DEBUG:
             message = f"All tags exist in historian"
             logger.info(message)
-            logger.info(notification.write_db_message_log(PG_CONN, 'Info', 'histAdapter',
+            logger.info(notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                           function_name, message))
     else:
         message = f"System Stopped - The following tags do not exist in historian: {tag_not_exists_list}"
         logger.error(message)
-        notification.write_db_message_log(PG_CONN, 'Error', 'histAdapter',function_name, message)
+        notification.write_db_message_log(POSTGRES_CONNECTION, 'Error', 'histAdapter',function_name, message)
         if MESSAGE_SUPPORT:
             notification.email_support()
         exit(-4)
