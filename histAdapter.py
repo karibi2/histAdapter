@@ -15,7 +15,7 @@ import inspect
 import traceback
 import pytz
 
-HIST_ADAPTER_VERSION = '25.07.07'
+HIST_ADAPTER_VERSION = '25.07.08'
 
 # Load environment variables from .env file
 load_dotenv()
@@ -209,12 +209,12 @@ def update_system_status(db_connection, mode, plant_ref=None, samples = 0):
                 match mode:
                     case 1:
                         cursor.execute('update system_status set value = %s where id = 1;', (date_str,))
-                        cursor.execute('update system_status set value = %s where id = 3;', (plant_ref,))
-                        cursor.execute('update system_status set value = %s where id = 5;', (samples,))
+                        cursor.execute('update system_status set value = %s where id = 3;', (list(plant_ref)[0],))
+                        cursor.execute('update system_status set value = %s where id = 5;', (str(samples),))
                     case 2:
                         cursor.execute('update system_status set value = %s where id = 2;', (date_str,))
                         cursor.execute('update system_status set value = %s where id = 4;', (plant_ref,))
-                        cursor.execute('update system_status set value = %s where id = 6;', (samples,))
+                        cursor.execute('update system_status set value = %s where id = 6;', (list(plant_ref)[0],))
 
                 connection.commit()
 
@@ -568,7 +568,7 @@ def process_assets():
     # Get all assets from the database
     function_name = 'process_assets'
     status, token = get_token()
-    sql_query = 'SELECT asset_id, tag_list, date_last_data FROM asset'
+    sql_query = 'SELECT asset_id, plant_ref, tag_list, date_last_data FROM asset'
     status_code, assets_df = query_postgres(POSTGRES_CONNECTION, sql_query)
 
     if status_code != 0:
