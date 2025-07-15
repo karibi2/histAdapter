@@ -15,7 +15,7 @@ import inspect
 import traceback
 import pytz
 
-HIST_ADAPTER_VERSION = '25.07.08'
+HIST_ADAPTER_VERSION = '25.07.14'
 
 # Load environment variables from .env file
 load_dotenv()
@@ -202,7 +202,7 @@ def update_system_status(db_connection, mode, plant_ref=None, samples = 0):
         # Establish a connection to the PostgreSQL database
         with psycopg.connect(**db_connection) as connection:
             # Create a cursor object to execute SQL queries
-            with connection.cursor() as cursor:
+           with connection.cursor() as cursor:
                 # Execute the query to insert the message log
                 # Pass the current datetime and log details as parameters
                 date_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -274,21 +274,19 @@ def extract_unique_tags(tag_list_df):
     """
 
     function_name = 'extract_unique_tags'
-    # Create a set to store unique tags
-    unique_tags = set()
+    # Append the three dataframe columns together
+    tag_list_df['all'] = tag_list_df['tag_list'] + ',' + tag_list_df['disturb_tag_list'] + ',' + tag_list_df['tag_filter']
 
-    # Iterate through each row in the DataFrame
-    for _, row in tag_list_df.iterrows():
-        # Skip rows with empty or NaN tag_list
-        if pd.isna(row['tag_list']) or row['tag_list'] == '':
-            continue
+    # Extract individual elements
+    all_fields_df =[]
+    for row in tag_list_df['all']:
+        fields = [field.strip() for field in row.split(',')]
+        all_fields_df.extend(fields)
 
-        # Split the comma-delimited list and add each tag to the set
-        tags = [tag.strip() for tag in row['tag_list'].split(',')]
-        unique_tags.update(tags)
-
-    # Join the unique tags into a comma-delimited string
-    return ','.join(sorted(unique_tags))
+    # Step 3: Get unique fields and join them back into a single comma-delimited string
+    unique_fields = list(set(all_fields_df))
+    result_string = ', '.join(unique_fields)
+    return result_string
 
 def get_token():
     """
@@ -732,7 +730,7 @@ def main():
 
 
     # Get taglist
-    sql_query = "select asset_id, plant_ref, tag_list, date_last_data from asset where historian = 'hist'"
+    sql_query = "select asset_id, plant_ref, tag_list, tag_filter, disturb_tag_list, date_last_data from asset where historian = 'hist'"
     status_code, tag_list_df = query_postgres(POSTGRES_CONNECTION, sql_query)
     if status_code != 0:
         message = "Error querying tag_list from database"
