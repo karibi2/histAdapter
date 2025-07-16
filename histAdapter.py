@@ -15,7 +15,7 @@ import inspect
 import traceback
 import pytz
 
-HIST_ADAPTER_VERSION = '25.07.14'
+HIST_ADAPTER_VERSION = '25.07.16'
 
 # Load environment variables from .env file
 load_dotenv()
@@ -261,6 +261,12 @@ def request_api(token, query_url):
     except:
         return False, None
 
+def combine_non_empty(row):
+    # Filter out None and empty strings, keep only valid strings
+    valid_values = [val for val in [row['tag_list'], row['tag_filter']] if isinstance(val, str) and val]
+    # Join with comma if there are valid values, otherwise return empty string
+    return ','.join(valid_values) if valid_values else ''
+
 
 def extract_unique_tags(tag_list_df):
     """
@@ -274,8 +280,10 @@ def extract_unique_tags(tag_list_df):
     """
 
     function_name = 'extract_unique_tags'
-    # Append the three dataframe columns together
-    tag_list_df['all'] = tag_list_df['tag_list'] + ',' + tag_list_df['disturb_tag_list'] + ',' + tag_list_df['tag_filter']
+    # Append the two dataframe columns together
+    # It is not necessary to concatenate the disturb list as it is a subset of the tag_list
+    # Simple combining is unsuitable as it doesn't handle nulls correctly
+    tag_list_df['all'] = tag_list_df.apply(combine_non_empty, axis=1)
 
     # Extract individual elements
     all_fields_df =[]
@@ -566,7 +574,7 @@ def process_assets():
     # Get all assets from the database
     function_name = 'process_assets'
     status, token = get_token()
-    sql_query = 'SELECT asset_id, plant_ref, tag_list, date_last_data FROM asset'
+    sql_query = 'SELECT asset_id, plant_ref, tag_list, tag_filter, date_last_data FROM asset'
     status_code, assets_df = query_postgres(POSTGRES_CONNECTION, sql_query)
 
     if status_code != 0:
@@ -597,7 +605,24 @@ def process_assets():
         asset_id = asset['asset_id']
         plant_ref = asset['plant_ref']
         tag_list = asset['tag_list']
+        tag_filter = asset['tag_filter']
         date_last_data = asset['date_last_data']
+
+
+
+        # This is needed to ensure that the filter tag is always included in the tag list
+        # Split the tag list into a series of tags
+        if tag_filter is not None and tag_filter != '':
+            tags = [f.strip() for f in tag_list.split(',')]
+            # Add the filter tag if missing
+            if tag_filter not in tags:
+                tag_list += ',' + tag_filter
+                if DEBUG:
+                    message = f"Adding filter tag {tag_filter} to the tag list {tag_list}"
+                    logger.info(message)
+                    notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
+                                                       function_name, message)
+
 
         if DEBUG:
             message = f"Processing asset ID: {asset_id}"
@@ -635,7 +660,7 @@ def process_assets():
             end_time = min(start_time + timedelta(hours=1), current_time)
 
             if DEBUG:
-                message = f"Processing time increment for asset {asset_id}: {start_time} to {end_time}"
+                message = f"Processing time increment for asset {asset_id}: {start_time} to {end_time} UTC"
                 logger.info(message)
                 notification.write_db_message_log(POSTGRES_CONNECTION, 'Info', 'histAdapter',
                                                   function_name, message)
